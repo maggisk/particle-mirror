@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<!-- "Add to Home Screen" on iOS opens it without Safari's bars -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Mirror">
+<meta name="theme-color" content="#05050a">
+<title>Particle Mirror</title>
+<style>
+  :root {
+    --bg: #05050a;
+    --fg: #ece9f5;
+    --dim: #8b87a3;
+    --accent: #ffb36b;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  canvas { display: block; }
+
+  #intro { position: fixed; inset: 0; z-index: 2; display: grid; place-items: center; padding: 16px; text-align: center;
+    background: radial-gradient(ellipse at center, #1b1030 0%, #05050a 70%); transition: opacity .9s ease; }
+  #intro.gone { opacity: 0; pointer-events: none; }
+  h1 { margin: 0 0 14px; font-weight: 200; letter-spacing: .35em; text-transform: uppercase; font-size: clamp(26px, 6vw, 60px); }
+  #intro p { margin: 0 auto 30px; max-width: 32em; line-height: 1.65; color: var(--dim); }
+  #start { font: inherit; font-size: 15px; letter-spacing: .2em; text-transform: uppercase; color: var(--bg); background: var(--accent);
+    border: 0; border-radius: 999px; padding: 14px 34px; cursor: pointer; box-shadow: 0 0 40px #ffb36b55; transition: transform .15s, box-shadow .15s; }
+  #start:hover { transform: scale(1.04); box-shadow: 0 0 60px #ffb36b88; }
+  #demo { display: block; margin: 18px auto 0; font: inherit; font-size: 13px; color: var(--dim); background: none; border: 0; cursor: pointer; text-decoration: underline; }
+  #err { color: #ff8a8a; min-height: 1.4em; margin-top: 18px; font-size: 14px; }
+
+  #hud { position: fixed; left: max(16px, env(safe-area-inset-left)); bottom: max(16px, env(safe-area-inset-bottom)); z-index: 1; font-size: 12px; color: var(--dim); letter-spacing: .05em;
+    display: flex; flex-direction: column; gap: 8px; transition: opacity .4s; }
+  #hud.hidden { opacity: 0; }
+  #hud kbd { color: var(--fg); font: inherit; border: 1px solid #ffffff22; border-radius: 4px; padding: 1px 5px; }
+  #meter { position: relative; width: 160px; height: 4px; background: #ffffff14; border-radius: 2px; }
+  #level { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent); border-radius: 2px; }
+  #toast { position: fixed; top: 24px; left: 50%; transform: translateX(-50%); z-index: 1; font-size: 13px; letter-spacing: .3em;
+    text-transform: uppercase; color: var(--fg); opacity: 0; transition: opacity .4s; pointer-events: none; }
+  #toast.show { opacity: .85; }
+  #touches { display: none; }
+  @media (pointer: coarse) { #keys { display: none; } #touches { display: block; } }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="intro">
+  <div>
+    <h1>Particle Mirror</h1>
+    <p>Your camera turns you into thirty thousand points of light.<br>
+       Move and they follow. Clap and you scatter like dust.<br>
+       Play music and they pulse. Nothing leaves your computer.</p>
+    <button id="start">Begin</button>
+    <button id="demo">no camera? watch the demo</button>
+    <div id="err"></div>
+  </div>
+</div>
+<div id="hud" class="hidden">
+  <div id="meter" title="microphone level"><div id="level"></div></div>
+  <div id="keys"><kbd>clap</kbd> or <kbd>space</kbd> scatter &nbsp; <kbd>C</kbd> colors &nbsp; <kbd>V</kbd> flip camera &nbsp; <kbd>F</kbd> fullscreen &nbsp; <kbd>H</kbd> hide</div>
+  <div id="touches"><kbd>clap</kbd> or <kbd>tap</kbd> scatter &nbsp; <kbd>swipe</kbd> colors &nbsp; <kbd>double tap</kbd> flip camera &nbsp; <kbd>hold</kbd> hide</div>
+</div>
+<div id="toast"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// ---------- particle grid ----------
+const COLS = 200, ROWS = 150, N = COLS * ROWS;
+const FOV = 50;
+
+const home = new Float32Array(N * 2);
+const radius = new Float32Array(N);
+const seed = new Float32Array(N);
+const pos = new Float32Array(N * 3);
+const vel = new Float32Array(N * 3);
+const col = new Float32Array(N * 3);
+const size = new Float32Array(N);
+const prevLum = new Float32Array(N);
+const glow = new Float32Array(N);
+
+for (let r = 0; r < ROWS; r++) {
+  for (let c = 0; c < COLS; c++) {
+    const i = r * COLS + c;
+    const x = c - (COLS - 1) / 2, y = (ROWS - 1) / 2 - r;
+    home[i * 2] = x; home[i * 2 + 1] = y;
+    radius[i] = Math.hypot(x, y);
+    seed[i] = Math.random();
+    // start scattered so the first thing you see is yourself assembling
+    pos[i * 3] = (Math.random() - .5) * 700;
+    pos[i * 3 + 1] = (Math.random() - .5) * 500;
+    pos[i * 3 + 2] = (Math.random() - .5) * 500;
+  }
+}
+
+// ---------- three.js ----------
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(FOV, innerWidth / innerHeight, 1, 3000);
+camera.position.set(0, 0, 160);
+
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+geo.setAttribute('aColor', new THREE.BufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage));
+geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1).setUsage(THREE.DynamicDrawUsage));
+
+const mat = new THREE.ShaderMaterial({
+  uniforms: { uScale: { value: 1 }, uPulse: { value: 0 } },
+  vertexShader: /* glsl */`
+    attribute vec3 aColor;
+    attribute float aSize;
+    uniform float uScale;
+    uniform float uPulse;
+    varying vec3 vColor;
+    void main() {
+      vColor = aColor;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      gl_PointSize = aSize * (1.0 + uPulse) * uScale / -mv.z;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: /* glsl */`
+    varying vec3 vColor;
+    void main() {
+      float d = length(gl_PointCoord - 0.5);
+      if (d > 0.5) discard;
+      float a = smoothstep(0.5, 0.0, d);
+      gl_FragColor = vec4(vColor * a * a, 1.0);
+    }`,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+const points = new THREE.Points(geo, mat);
+points.frustumCulled = false;
+scene.add(points);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const BLOOM = 0.6;
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), BLOOM, 0.5, 0.2);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+function resize() {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  // world units -> pixels at distance 1
+  mat.uniforms.uScale.value = renderer.getDrawingBufferSize(new THREE.Vector2()).y / (2 * Math.tan(THREE.MathUtils.degToRad(FOV / 2)));
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- palettes ----------
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+const smoothstep = (a, b, v) => { const t = clamp01((v - a) / (b - a)); return t * t * (3 - 2 * t); };
+
+function ramp(stops, v, out, o) {
+  const n = stops.length - 1, f = clamp01(v) * n, k = Math.min(n - 1, f | 0), t = f - k;
+  const a = stops[k], b = stops[k + 1];
+  out[o] = a[0] + (b[0] - a[0]) * t;
+  out[o + 1] = a[1] + (b[1] - a[1]) * t;
+  out[o + 2] = a[2] + (b[2] - a[2]) * t;
+}
+function hsl(h, s, l, out, o) {
+  const f = n => { const k = (n + h * 12) % 12; return l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+  out[o] = f(0); out[o + 1] = f(8); out[o + 2] = f(4);
+}
+
+const EMBER = [[.15, .02, .05], [.9, .2, .05], [1, .6, .15], [1, .95, .8]];
+const ICE = [[.02, .05, .2], [.1, .35, .9], [.4, .85, 1], [.95, 1, 1]];
+const PALETTES = [
+  { name: 'ember', fn: (o, L) => ramp(EMBER, L, col, o) },
+  { name: 'true color', fn: (o, L, r, g, b) => {
+      const l = (r + g + b) / 3, s = 1.7;
+      col[o] = clamp01(l + (r - l) * s); col[o + 1] = clamp01(l + (g - l) * s); col[o + 2] = clamp01(l + (b - l) * s);
+    } },
+  { name: 'ice', fn: (o, L) => ramp(ICE, L, col, o) },
+  { name: 'neon', fn: (o, L, r, g, b, hx, t) => hsl((hx / COLS * .7 + t * .04 + L * .35) % 1 + 1, 1, .55, col, o) },
+];
+let palIdx = 0;
+
+// ---------- sources ----------
+const video = document.createElement('video');
+video.playsInline = true; video.muted = true;
+const sampler = document.createElement('canvas');
+sampler.width = COLS; sampler.height = ROWS;
+const sctx = sampler.getContext('2d', { willReadFrequently: true });
+let source = null; // 'camera' | 'demo'
+let facing = 'user';
+try { facing = localStorage.getItem('facing') || facing; } catch {}
+
+async function openCamera() {
+  video.srcObject?.getTracks().forEach(tr => tr.stop());
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: facing } });
+  video.srcObject = stream;
+  await video.play();
+}
+
+async function flipCamera() {
+  facing = facing === 'user' ? 'environment' : 'user';
+  try { localStorage.setItem('facing', facing); } catch {}
+  scatter(1.2); // hide the swap behind an explosion
+  try { await openCamera(); toast(facing === 'user' ? 'front camera' : 'back camera'); }
+  catch { toast('couldn’t switch camera'); }
+}
+
+function sampleCamera() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return null;
+  const target = COLS / ROWS;
+  let sw = vw, sh = vh, sx = 0, sy = 0;
+  if (vw / vh > target) { sw = vh * target; sx = (vw - sw) / 2; } else { sh = vw / target; sy = (vh - sh) / 2; }
+  // mirror the selfie camera, like a real mirror; the back camera already sees the room the right way round
+  if (facing === 'user') sctx.setTransform(-1, 0, 0, 1, COLS, 0); else sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.drawImage(video, sx, sy, sw, sh, 0, 0, COLS, ROWS);
+  return sctx.getImageData(0, 0, COLS, ROWS).data;
+}
+
+function sampleDemo(t) {
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.fillStyle = '#000';
+  sctx.fillRect(0, 0, COLS, ROWS);
+  // a bobbing head-and-shoulders figure plus a waving hand
+  const cx = COLS / 2 + Math.sin(t * .6) * 18, cy = ROWS * .42 + Math.sin(t * 1.1) * 4;
+  const blob = (x, y, rx, ry, a) => {
+    sctx.save(); sctx.translate(x, y); sctx.scale(rx, ry);
+    const g = sctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+    g.addColorStop(0, `rgba(235,200,170,${a})`); g.addColorStop(.7, `rgba(180,140,120,${a * .7})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+    sctx.fillStyle = g; sctx.beginPath(); sctx.arc(0, 0, 1, 0, Math.PI * 2); sctx.fill(); sctx.restore();
+  };
+  blob(cx, cy + 80, 70, 45, .85);
+  blob(cx, cy, 26, 32, 1);
+  blob(cx + 55 + Math.sin(t * 3) * 10, cy - 10 + Math.cos(t * 3) * 14, 11, 13, .9);
+  return sctx.getImageData(0, 0, COLS, ROWS).data;
+}
+
+// ---------- audio ----------
+let analyser = null, timeBuf, freqBuf;
+let rmsAvg = 0.01, lastClap = 0, pulse = 0;
+const levelEl = document.getElementById('level');
+
+async function startMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    const ctx = new AudioContext();
+    // iOS starts the context suspended when it's created after an await; any later touch wakes it
+    if (ctx.state !== 'running') {
+      ctx.resume();
+      addEventListener('pointerdown', () => ctx.resume(), { once: true });
+    }
+    const src = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.minDecibels = -85;
+    analyser.maxDecibels = -20;
+    analyser.smoothingTimeConstant = .6;
+    src.connect(analyser);
+    timeBuf = new Float32Array(analyser.fftSize);
+    freqBuf = new Uint8Array(analyser.frequencyBinCount);
+  } catch {
+    toast('no microphone — press space to scatter');
+  }
+}
+
+function readAudio(now) {
+  if (!analyser) { pulse *= .9; return; }
+  analyser.getFloatTimeDomainData(timeBuf);
+  let sum = 0;
+  for (let i = 0; i < timeBuf.length; i++) sum += timeBuf[i] * timeBuf[i];
+  const rms = Math.sqrt(sum / timeBuf.length);
+
+  // a clap is a sudden spike well above the recent loudness
+  if (rms > .06 && rms > rmsAvg * 4 && now - lastClap > 700) {
+    lastClap = now;
+    scatter(Math.min(2, .7 + rms * 4));
+  }
+  rmsAvg = rmsAvg * .95 + rms * .05;
+
+  // bass (~50–300 Hz) drives the pulse
+  analyser.getByteFrequencyData(freqBuf);
+  let bass = 0;
+  for (let i = 1; i <= 6; i++) bass += freqBuf[i];
+  bass /= 6 * 255;
+  const target = Math.pow(Math.max(0, (bass - .35) / .65), 1.5);
+  pulse += (target - pulse) * (target > pulse ? .5 : .12);
+
+  levelEl.style.width = Math.min(100, rms / .25 * 100) + '%';
+}
+
+// ---------- motion ----------
+let t = 0, boomAt = 0, flash = 0;
+
+function scatter(strength = 1) {
+  boomAt = t;
+  flash = .9 * strength;
+  for (let i = 0; i < N; i++) {
+    const a = Math.atan2(home[i * 2 + 1], home[i * 2]) + (seed[i] - .5) * 1.4;
+    const sp = (1 + Math.random() * 3.5) * strength;
+    vel[i * 3] += Math.cos(a) * sp;
+    vel[i * 3 + 1] += Math.sin(a) * sp;
+    vel[i * 3 + 2] += (Math.random() - .45) * sp * 1.4;
+  }
+}
+
+function update(data) {
+  const settle = smoothstep(1.0, 3.2, t - boomAt); // 0 just after a scatter, 1 when reassembled
+  const k = .0015 + .07 * settle;
+  const damp = .975 - .115 * settle;
+  const swirl = .025 * (1 - settle);
+  const paint = PALETTES[palIdx].fn;
+
+  for (let i = 0; i < N; i++) {
+    const p = i * 4, o = i * 3;
+    const r = data[p] / 255, g = data[p + 1] / 255, b = data[p + 2] / 255;
+    const lum = .299 * r + .587 * g + .114 * b;
+    const L = smoothstep(.08, .9, lum);
+
+    const m = Math.abs(lum - prevLum[i]);
+    prevLum[i] = lum;
+    let gl = glow[i] * .9;
+    if (m > .09) gl = Math.min(1, gl + m * 2.5);
+    glow[i] = gl;
+
+    const hx = home[i * 2], hy = home[i * 2 + 1];
+    let x = pos[o], y = pos[o + 1], z = pos[o + 2];
+    let vx = vel[o], vy = vel[o + 1], vz = vel[o + 2];
+
+    const tz = (L - .5) * 30 + pulse * 14 * Math.sin(radius[i] * .09 - t * 5) + gl * 10;
+    vx += (hx - x) * k;
+    vy += (hy - y) * k;
+    vz += (tz - z) * k;
+
+    if (swirl > 0) {
+      vx += Math.sin(y * .05 + t * .7) * swirl;
+      vy += Math.cos(x * .05 + t * .9) * swirl;
+      vz += Math.sin((x + y) * .03 + t) * swirl;
+    }
+    // fast movement flicks particles toward the camera
+    if (m > .18 && settle > .9) {
+      vx += (seed[i] - .5) * m * 6;
+      vy += ((seed[i] * 7.31) % 1 - .5) * m * 6;
+      vz += m * 10;
+    }
+
+    vx *= damp; vy *= damp; vz *= damp;
+    pos[o] = x + vx; pos[o + 1] = y + vy; pos[o + 2] = z + vz;
+    vel[o] = vx; vel[o + 1] = vy; vel[o + 2] = vz;
+
+    size[i] = .5 + L * 2.4 + gl * 1.6;
+    paint(o, L, r, g, b, hx, t);
+    const I = .03 + .3 * L;
+    col[o] = col[o] * I + gl * .45;
+    col[o + 1] = col[o + 1] * I + gl * .32;
+    col[o + 2] = col[o + 2] * I + gl * .2;
+  }
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.aColor.needsUpdate = true;
+  geo.attributes.aSize.needsUpdate = true;
+}
+
+// ---------- camera drift ----------
+let mx = 0, my = 0;
+addEventListener('pointermove', e => {
+  if (e.pointerType !== 'mouse') return; // on a phone the camera just drifts on its own
+  mx = e.clientX / innerWidth * 2 - 1; my = e.clientY / innerHeight * 2 - 1;
+});
+
+// ---------- loop ----------
+let last = null;
+function frame(now) {
+  // rAF timestamps can trail performance.now(), so never let time run backwards
+  const dt = last === null ? 0 : Math.max(0, Math.min(.05, (now - last) / 1000));
+  last = now;
+  t += dt;
+
+  const data = source === 'camera' ? sampleCamera() : sampleDemo(t);
+  readAudio(now);
+  if (data) update(data);
+
+  flash *= .93;
+  bloom.strength = BLOOM + flash + pulse * .4;
+  mat.uniforms.uPulse.value = pulse * .5;
+
+  const tx = mx * 70 + Math.sin(t * .13) * 12, ty = -my * 45 + Math.sin(t * .17) * 8;
+  camera.position.x += (tx - camera.position.x) * .04;
+  camera.position.y += (ty - camera.position.y) * .04;
+  camera.lookAt(0, 0, 0);
+
+  composer.render();
+  requestAnimationFrame(frame);
+}
+
+// ---------- UI ----------
+const intro = document.getElementById('intro');
+const hud = document.getElementById('hud');
+const toastEl = document.getElementById('toast');
+let toastTimer;
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+}
+
+// a phone left running on a shelf must not go to sleep
+let wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState !== 'visible' || !running) return;
+  keepAwake();
+  // iOS ends the camera track when the app is backgrounded
+  if (source === 'camera') {
+    const track = video.srcObject?.getVideoTracks()[0];
+    try { track?.readyState === 'live' ? await video.play() : await openCamera(); } catch {}
+  }
+});
+
+let running = false;
+function go(kind) {
+  source = kind;
+  intro.classList.add('gone');
+  hud.classList.remove('hidden');
+  boomAt = t;
+  keepAwake();
+  if (!running) { running = true; requestAnimationFrame(frame); }
+}
+
+document.getElementById('start').addEventListener('click', async () => {
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {
+    await openCamera();
+  } catch (e) {
+    err.textContent = 'Couldn’t open the camera (' + (e.name || e) + '). Try the demo instead.';
+    return;
+  }
+  go('camera');
+  startMic();
+});
+document.getElementById('demo').addEventListener('click', () => { go('demo'); startMic(); });
+
+addEventListener('keydown', e => {
+  if (!running) return;
+  if (e.code === 'Space') { e.preventDefault(); scatter(1.2); }
+  else if (e.key === 'c' || e.key === 'C') { palIdx = (palIdx + 1) % PALETTES.length; toast(PALETTES[palIdx].name); }
+  else if (e.key === 'h' || e.key === 'H') hud.classList.toggle('hidden');
+  else if ((e.key === 'v' || e.key === 'V') && source === 'camera') flipCamera();
+  else if (e.key === 'f' || e.key === 'F') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+
+// touch: tap scatters, swipe changes colors, double tap flips camera, hold hides the hud
+let touch = null, lastTap = 0, holdTimer;
+addEventListener('pointerdown', e => {
+  if (!running || e.pointerType === 'mouse') return;
+  touch = { x: e.clientX, y: e.clientY, at: e.timeStamp };
+  holdTimer = setTimeout(() => { touch = null; hud.classList.toggle('hidden'); }, 600);
+});
+addEventListener('pointerup', e => {
+  clearTimeout(holdTimer);
+  if (!touch) return;
+  const dx = e.clientX - touch.x, dy = e.clientY - touch.y;
+  touch = null;
+  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
+    palIdx = (palIdx + PALETTES.length + (dx < 0 ? 1 : -1)) % PALETTES.length;
+    toast(PALETTES[palIdx].name);
+  } else if (Math.hypot(dx, dy) < 20) {
+    if (e.timeStamp - lastTap < 350 && source === 'camera') { lastTap = 0; flipCamera(); }
+    else { lastTap = e.timeStamp; scatter(1.2); }
+  }
+});
+addEventListener('pointercancel', () => { clearTimeout(holdTimer); touch = null; });
+
+if (new URLSearchParams(location.search).has('demo')) go('demo');
+</script>
+</body>
+</html>
